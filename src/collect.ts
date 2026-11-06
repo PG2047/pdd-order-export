@@ -1,11 +1,16 @@
 import { createIs, createAssert, type tags } from "typia";
-import type { PddClient, Order, OrderDetail } from "./pdd";
+import { PddError, type PddClient, type Order, type OrderDetail } from "./pdd";
 
 export interface CollectedOrder {
   readonly order: Order;
-  /** 未请求详情。 */
+  /** 未请求或未能取得详情；读取失败时由 detailFailure 说明。 */
   readonly detail: OrderDetail | null;
+  readonly detailFailure?: "unavailable" | "paused";
+  /** 已设置日期范围，但无法从订单编号估算日期；保留该订单供核对。 */
+  readonly dateUncertain?: true;
 }
+
+type SelectedOrder = Pick<CollectedOrder, "order" | "dateUncertain">;
 
 /** 外层按需分页并筛选，内层按配置获取详情；消费方自行保存已产出的条目。 */
 export async function* collectOrders(
@@ -57,31 +62,49 @@ function selectPageOrders(
   orders: readonly Order[],
   startDate: Date | null,
   endDate: Date | null,
-): { selectedOrders: Order[]; reachedStart: boolean } {
-  const selectedOrders: Order[] = [];
+): { selectedOrders: SelectedOrder[]; reachedStart: boolean } {
+  const selectedOrders: SelectedOrder[] = [];
   for (const order of orders) {
     if (startDate || endDate) {
       const date = estimateOrderDate(order.order_sn);
+      if (date === null) {
+        selectedOrders.push({ order, dateUncertain: true });
+        continue;
+      }
       if (startDate && date < startDate)
         return { selectedOrders, reachedStart: true };
       if (endDate && date > endDate) continue;
     }
-    selectedOrders.push(order);
+    selectedOrders.push({ order });
   }
   return { selectedOrders, reachedStart: false };
 }
 
 async function* collectPageOrders(
   source: Pick<PddClient, "getOrderDetail">,
-  orders: readonly Order[],
+  orders: readonly SelectedOrder[],
   includeDetails: boolean,
   signal: AbortSignal,
 ): AsyncGenerator<CollectedOrder, void, void> {
-  for (const order of orders) {
-    const detail = includeDetails
-      ? await source.getOrderDetail(order.order_sn, signal)
-      : null;
-    yield { order, detail };
+  for (const selected of orders) {
+    signal.throwIfAborted();
+    let detail: OrderDetail | null = null;
+    if (includeDetails) {
+      try {
+        detail = await source.getOrderDetail(selected.order.order_sn, signal);
+      } catch (error) {
+        signal.throwIfAborted();
+        if (
+          !(error instanceof PddError) ||
+          error.code !== "detail-unavailable"
+        ) {
+          throw error;
+        }
+        yield { ...selected, detail: null, detailFailure: "unavailable" };
+        continue;
+      }
+    }
+    yield { ...selected, detail };
   }
 }
 
@@ -89,13 +112,13 @@ const isCalendarDateText = createIs<string & tags.Format<"date">>();
 
 /**
  * 从订单号前六位估算订单日期，不等同于支付时间。
- * @throws 无法识别日期或日期不存在时抛出错误。
+ * 无法识别日期或日期不存在时返回 null，不丢弃整页订单。
  */
-function estimateOrderDate(id: string): Date {
+function estimateOrderDate(id: string): Date | null {
   const parts = /^(\d{2})(\d{2})(\d{2})-/.exec(id);
   const date = parts ? `20${parts[1]}-${parts[2]}-${parts[3]}` : "";
   if (!isCalendarDateText(date)) {
-    throw new Error("无法识别订单日期。");
+    return null;
   }
   return new Date(date);
 }

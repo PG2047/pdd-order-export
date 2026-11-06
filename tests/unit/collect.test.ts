@@ -241,26 +241,88 @@ test("cancellation during a detail request throws without generating a partial e
   expect(api.getOrderDetail).toHaveBeenCalledTimes(2);
 });
 
-test("detail failures propagate unchanged and start no subsequent requests", async () => {
-  const api = source([[order(), order("261017-b")]]),
-    error = new PddError("detail unavailable");
-  api.getOrderDetail.mockRejectedValueOnce(error);
-  await expect(drain(collectOrders(api, options, signal))).rejects.toBe(error);
-  expect(api.getOrderDetail).toHaveBeenCalledOnce();
-  expect(api.getOrders).toHaveBeenCalledOnce();
+test.each(["request", "session", "schema"] as const)(
+  "%s detail failures propagate unchanged and start no subsequent requests",
+  async (code) => {
+    const api = source([[order(), order("261017-b")]]),
+      error = new PddError("detail unavailable", code);
+    api.getOrderDetail.mockRejectedValueOnce(error);
+    await expect(drain(collectOrders(api, options, signal))).rejects.toBe(
+      error,
+    );
+    expect(api.getOrderDetail).toHaveBeenCalledOnce();
+    expect(api.getOrders).toHaveBeenCalledOnce();
+  },
+);
+
+test("consecutive unavailable details across pages never skip remaining detail requests", async () => {
+  const orders = ["a", "b", "c", "d", "e"].map((id) => order(`261017-${id}`));
+  const api = source([orders.slice(0, 2), orders.slice(2, 4), orders.slice(4)]);
+  api.getOrderDetail.mockRejectedValue(
+    new PddError("missing rawData", "detail-unavailable"),
+  );
+  const entries = await drain(collectOrders(api, options, signal));
+  expect(entries.map((entry) => entry.order)).toEqual(orders);
+  expect(entries.map((entry) => entry.detailFailure)).toEqual([
+    "unavailable",
+    "unavailable",
+    "unavailable",
+    "unavailable",
+    "unavailable",
+  ]);
+  expect(entries.every((entry) => entry.detail === null)).toBe(true);
+  expect(api.getOrderDetail).toHaveBeenCalledTimes(5);
+  expect(api.getOrders).toHaveBeenCalledTimes(4);
 });
 
-test("invalid dates reject page selection before any detail request", async () => {
-  const api = source([[order("not-a-date")]]);
-  await expect(
-    collectOrders(
-      api,
-      { ...options, startDate: new Date("2026-10-01") },
-      signal,
-    ).next(),
-  ).rejects.toThrow();
-  expect(api.getOrderDetail).not.toHaveBeenCalled();
+test("intermittent unavailable details preserve later successful details", async () => {
+  const orders = Array.from({ length: 6 }, (_, index) =>
+    order(`261017-${index}`),
+  );
+  const api = source([orders.slice(0, 3), orders.slice(3)]);
+  api.getOrderDetail.mockImplementation(async (id) => {
+    if (id !== "261017-2" && id !== "261017-5") {
+      throw new PddError("missing rawData", "detail-unavailable");
+    }
+    return { orderSn: id, marker: id };
+  });
+  const entries = await drain(collectOrders(api, options, signal));
+  expect(entries.map((entry) => entry.order)).toEqual(orders);
+  expect(entries.filter((entry) => entry.detail !== null)).toHaveLength(2);
+  expect(entries.some((entry) => entry.detailFailure === "paused")).toBe(false);
+  expect(api.getOrderDetail).toHaveBeenCalledTimes(6);
 });
+
+test.each([true, false])(
+  "unknown or invalid order dates are retained and flagged (details=%s)",
+  async (includeDetails) => {
+    const unknown = order("not-a-date");
+    const invalid = order("261332-invalid");
+    const valid = order("261017-valid");
+    const api = source([[unknown, invalid, valid]]);
+    const entries = await drain(
+      collectOrders(
+        api,
+        { ...options, includeDetails, startDate: new Date("2026-10-01") },
+        signal,
+      ),
+    );
+    expect(entries.map((entry) => entry.order)).toEqual([
+      unknown,
+      invalid,
+      valid,
+    ]);
+    expect(entries.map((entry) => entry.dateUncertain)).toEqual([
+      true,
+      true,
+      undefined,
+    ]);
+    expect(api.getOrderDetail).toHaveBeenCalledTimes(includeDetails ? 3 : 0);
+    expect(
+      entries.every((entry) => includeDetails || entry.detail === null),
+    ).toBe(true);
+  },
+);
 
 test("list-only iteration accepts opaque IDs and consumer break needs no detail request", async () => {
   const api = source([[order("not-a-date"), order("another")]]);

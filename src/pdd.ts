@@ -24,7 +24,8 @@ export class PddError extends Error {
 
   constructor(
     message: string,
-    readonly code: "request" | "session" | "schema" = "request",
+    readonly code:
+      "request" | "session" | "schema" | "detail-unavailable" = "request",
   ) {
     super(message);
   }
@@ -202,6 +203,6 @@ function parseOrderDetail(html: string): OrderDetail {
   }
   throw new PddError(
     "详情页缺少可解析的数据，可能需要重新登录或接口已变更。",
-    "schema",
+    "detail-unavailable",
   );
 }

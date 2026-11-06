@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { beforeEach, afterEach, expect, test, vi } from "vitest";
 import { exportFile, downloadFile } from "../../src/export";
 import type { CollectedOrder } from "../../src/collect";
+import { parse } from "papaparse";
 
 beforeEach(() => vi.stubGlobal("Blob", NodeBlob));
 afterEach(() => {
@@ -78,6 +79,55 @@ test.each(
     expect(JSON.parse(await json.blob.text())).toEqual(before);
   },
 );
+
+test("exports identify orders whose selected date range could not be checked", async () => {
+  const entries: CollectedOrder[] = [
+    { order: { order_sn: "261017-a", offset: "a" }, detail: null },
+    {
+      order: { order_sn: "legacy-order", offset: "b" },
+      detail: null,
+      dateUncertain: true,
+    },
+  ];
+  const csv = await exportFile(entries, "csv", null, null).blob.text();
+  const parsed = parse<Record<string, string>>(csv, { header: true });
+  expect(parsed.errors).toEqual([]);
+  expect(parsed.data.map((row) => [row.订单编号, row.日期核对])).toEqual([
+    ["261017-a", ""],
+    ["legacy-order", "日期待核对"],
+  ]);
+  const json = await exportFile(entries, "json", null, null).blob.text();
+  expect(JSON.parse(json)).toEqual(entries);
+});
+
+test("exports distinguish missing details from an interrupted order list", async () => {
+  const entries: CollectedOrder[] = [
+    { order: { order_sn: "a", offset: "a" }, detail: { orderSn: "a" } },
+    {
+      order: { order_sn: "b", offset: "b" },
+      detail: null,
+      detailFailure: "unavailable",
+    },
+    {
+      order: { order_sn: "c", offset: "c" },
+      detail: null,
+      detailFailure: "paused",
+    },
+  ];
+  const csv = exportFile(entries, "csv", null, null);
+  expect(csv.name).toBe("拼多多账单_不限至不限_详情不完整.csv");
+  const rows = parse<Record<string, string>>(await csv.blob.text(), {
+    header: true,
+  }).data;
+  expect(rows.map((row) => [row.订单编号, row.详情状态])).toEqual([
+    ["a", "已获取"],
+    ["b", "详情未能解析"],
+    ["c", "详情已暂停读取"],
+  ]);
+  expect(exportFile(entries, "json", null, null, true).name).toBe(
+    "拼多多账单_不限至不限_不完整.json",
+  );
+});
 
 test.each([
   {

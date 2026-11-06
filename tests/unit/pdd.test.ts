@@ -213,7 +213,7 @@ test("rejects JavaScript expressions inside rawData without executing them", asy
     );
   const pending = expect(
     client(fetcher).getOrderDetail("261017-a", new AbortController().signal),
-  ).rejects.toMatchObject({ code: "schema" });
+  ).rejects.toMatchObject({ code: "detail-unavailable" });
   await vi.runAllTimersAsync();
   await pending;
   expect(Reflect.get(globalThis, "__pddProbe")).toBe(false);

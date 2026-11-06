@@ -14,3 +14,8 @@ Thumbs.db
 private/
 exports/
 captures/
+
+# Local account exports and diagnostics
+/拼多多账单_*
+/reports/
+*.har

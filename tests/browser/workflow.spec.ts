@@ -554,6 +554,37 @@ test("CSV failure explains the JSON fallback and keeps the collected data", asyn
   await expect(shop.panel.getByRole("status")).toHaveText("收集完成。");
 });
 
+test("installed fixed script finishes date-filtered paging with an unrecognizable order number", async ({
+  shop,
+}) => {
+  const { page, fixture, panel, file } = shop;
+  fixture.orders[1]!.order_sn = "legacy-order";
+  let pages = 0;
+  await page.route("**/proxy/api/api/aristotle/order_list_v4?*", (route) => {
+    const order = fixture.orders[pages++];
+    return route.fulfill({ json: { orders: order ? [order] : [] } });
+  });
+  await panel.getByLabel("开始日期").fill("2026-10-01");
+  await panel.getByLabel("结束日期").fill("2026-10-31");
+  await panel.getByRole("button", { name: "开始收集", exact: true }).click();
+  const json = panel.getByRole("button", { name: "导出 JSON", exact: true });
+  await expect(json).toBeEnabled();
+  await expect(panel.getByRole("alert")).toBeHidden();
+  await expect(panel.getByRole("note")).toContainText(
+    "1 笔订单无法按编号核对日期",
+  );
+  expect(pages).toBe(3);
+  const download = page.waitForEvent("download");
+  await json.click();
+  const entries = JSON.parse((await file(await download)).bytes.toString());
+  expect(entries.map((entry: { order: unknown }) => entry.order)).toEqual(
+    fixture.orders,
+  );
+  expect(
+    entries.map((entry: { dateUncertain?: true }) => entry.dateUncertain),
+  ).toEqual([undefined, true]);
+});
+
 test("denied detail access shows a login hint without partial exports", async ({
   shop,
 }) => {
@@ -573,5 +604,108 @@ test("denied detail access shows a login hint without partial exports", async ({
   ).toBeEnabled();
   await expect(shop.dialog).not.toContainText("Internal response details");
   expect(downloads).toHaveLength(0);
-  await expect(shop.panel.getByRole("button", { name: /JSON/ })).toHaveCount(0);
+  await expect(
+    shop.panel
+      .locator('[data-ui="export"]')
+      .getByRole("button", { name: /JSON/ }),
+  ).toHaveCount(0);
+});
+
+test("an unavailable detail retains that order and collects later details before exporting", async ({
+  shop,
+}) => {
+  const { page, fixture, panel, file } = shop;
+  fixture.orders.push({
+    order_sn: "261017-c",
+    offset: "cursor:c",
+    order_amount: 250,
+  });
+  await page.route("**/order.html?*", (route) => {
+    const id = new URL(route.request().url()).searchParams.get("order_sn");
+    if (id !== "261017-b") return route.fallback();
+    return route.fulfill({
+      contentType: "text/html",
+      body: "<main>Detail unavailable</main>",
+    });
+  });
+  await panel.getByRole("button", { name: "开始收集", exact: true }).click();
+  await expect(panel.getByRole("status")).toHaveText(
+    "订单列表收集完成，详情不完整。",
+  );
+  await expect(
+    panel.getByText("已收集 3 笔订单 · 详情 2 笔", { exact: true }),
+  ).toBeVisible();
+  await expect(panel.getByRole("note")).toContainText("1 笔订单缺少详情");
+  await expect(panel.getByRole("alert")).toBeHidden();
+  const download = page.waitForEvent("download");
+  await panel
+    .getByRole("button", { name: "导出 JSON（详情不完整）", exact: true })
+    .click();
+  const exported = await file(await download);
+  expect(exported.name).toBe("拼多多账单_不限至不限_详情不完整.json");
+  const entries = JSON.parse(exported.bytes.toString());
+  expect(entries.map((entry: { order: unknown }) => entry.order)).toEqual(
+    fixture.orders,
+  );
+  expect(entries[1]).toMatchObject({
+    detail: null,
+    detailFailure: "unavailable",
+  });
+  expect(entries[2].detail).toMatchObject({ orderSn: "261017-c" });
+});
+
+test("imported JSON resumes only missing details and exports all original orders", async ({
+  shop,
+}) => {
+  const { page, panel, fixture, file } = shop;
+  fixture.orders.push(
+    { order_sn: "261017-c", offset: "cursor:c", order_amount: 100 },
+    { order_sn: "261017-d", offset: "cursor:d", order_amount: 200 },
+  );
+  const entries = fixture.orders.map((order, index) => ({
+    order,
+    detail: index < 2 ? { orderSn: order.order_sn, original: true } : null,
+    ...(index >= 2 ? { detailFailure: "paused" } : {}),
+  }));
+  await expect(
+    panel.getByText("固定版 2026-10-25.4", { exact: true }),
+  ).toBeVisible();
+  await panel.getByLabel("导入已有 JSON", { exact: true }).setInputFiles({
+    name: "saved-orders.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify(entries)),
+  });
+  await expect(
+    panel.getByText("已有 4 笔订单 · 保留详情 2 笔 · 待补 2 笔", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  expect(fixture.requests).toHaveLength(0);
+  await panel
+    .getByRole("button", { name: "仅补齐缺失的 2 笔详情", exact: true })
+    .click();
+  await expect(
+    panel.locator('[data-ui="export-result"] [role="status"]'),
+  ).toHaveText("导入订单的详情已齐全。");
+  expect(fixture.requests.map((request) => request.path)).toEqual([
+    "/order.html",
+    "/order.html",
+  ]);
+  const download = page.waitForEvent("download");
+  await panel.getByRole("button", { name: "导出 JSON", exact: true }).click();
+  const exported = await file(await download);
+  expect(exported.name).toBe("拼多多账单_导入订单_补齐详情.json");
+  const result = JSON.parse(exported.bytes.toString());
+  expect(result.slice(0, 2)).toEqual(entries.slice(0, 2));
+  expect(result.map((entry: { order: unknown }) => entry.order)).toEqual(
+    fixture.orders,
+  );
+  expect(
+    result
+      .slice(2)
+      .every(
+        (entry: { detail: unknown; detailFailure?: string }) =>
+          entry.detail !== null && !entry.detailFailure,
+      ),
+  ).toBe(true);
 });

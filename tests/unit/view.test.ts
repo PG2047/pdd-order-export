@@ -180,7 +180,10 @@ test.each([2026, 10000])(
     native.requestSubmit();
     await vi.waitFor(() => expect(exports()?.hidden ?? true).toBe(false));
     expect(collection.collectOrders).toHaveBeenCalledWith(
-      expect.any(PddClient),
+      expect.objectContaining({
+        getOrders: expect.any(Function),
+        getOrderDetail: expect.any(Function),
+      }),
       {
         startDate: date(17),
         endDate: date(18),
@@ -302,7 +305,10 @@ test("busy updates keep native draft nodes and submit their current values", asy
   expect(root.querySelector("progress")!.hasAttribute("value")).toBe(false);
   expect(root.querySelector("hr")!.hidden).toBe(false);
   expect(collection.collectOrders).toHaveBeenCalledWith(
-    expect.any(PddClient),
+    expect.objectContaining({
+      getOrders: expect.any(Function),
+      getOrderDetail: expect.any(Function),
+    }),
     expect.objectContaining({ pageSize: 30 }),
     expect.any(AbortSignal),
   );
@@ -537,6 +543,194 @@ test("a detail failure shows the error without exposing a partial export", async
   expect(files.downloadFile).not.toHaveBeenCalled();
 });
 
+test("import and resume preserve successful details and never fetch the order list", async () => {
+  const entries: CollectedOrder[] = [
+    {
+      order: { order_sn: "261017-a", offset: "a" },
+      detail: { orderSn: "261017-a", keep: "original" },
+    },
+    {
+      order: { order_sn: "261017-b", offset: "b" },
+      detail: null,
+      detailFailure: "unavailable",
+    },
+    {
+      order: { order_sn: "261017-c", offset: "c" },
+      detail: null,
+      detailFailure: "paused",
+    },
+  ];
+  const { root, action } = ui(createView());
+  const upload = root.querySelector<HTMLInputElement>('input[type="file"]')!;
+  const file = new File([], "saved.json", { type: "application/json" });
+  Object.defineProperty(file, "text", {
+    value: async () => JSON.stringify(entries),
+  });
+  Object.defineProperty(upload, "files", { value: [file], configurable: true });
+  upload.dispatchEvent(new Event("change", { bubbles: true }));
+  await vi.waitFor(() =>
+    expect(root.textContent).toContain("保留详情 1 笔 · 待补 2 笔"),
+  );
+  expect(PddClient.prototype.getOrders).not.toHaveBeenCalled();
+  expect(PddClient.prototype.getOrderDetail).not.toHaveBeenCalled();
+  action("仅补齐缺失的 2 笔详情").click();
+  await vi.waitFor(() =>
+    expect(root.textContent).toContain("导入订单的详情已齐全。"),
+  );
+  expect(PddClient.prototype.getOrders).not.toHaveBeenCalled();
+  expect(
+    vi.mocked(PddClient.prototype.getOrderDetail).mock.calls.map(([id]) => id),
+  ).toEqual(["261017-b", "261017-c"]);
+  action("导出 JSON").click();
+  expect(files.exportFile).toHaveBeenCalledWith(
+    [
+      entries[0],
+      { order: entries[1]!.order, detail: { orderSn: "261017-b" } },
+      { order: entries[2]!.order, detail: { orderSn: "261017-c" } },
+    ],
+    "json",
+    null,
+    null,
+    false,
+    true,
+  );
+  const invalid = new File([], "invalid.json");
+  Object.defineProperty(invalid, "text", {
+    value: async () => "private invalid input",
+  });
+  Object.defineProperty(upload, "files", {
+    value: [invalid],
+    configurable: true,
+  });
+  upload.dispatchEvent(new Event("change", { bubbles: true }));
+  await vi.waitFor(() =>
+    expect(root.textContent).toContain("已有结果已保留。"),
+  );
+  expect(root.textContent).not.toContain("private invalid input");
+  expect(root.textContent).toContain(
+    "已有 3 笔订单 · 保留详情 3 笔 · 待补 0 笔",
+  );
+});
+
+test("unavailable details keep list results and show explicit detail incompleteness", async () => {
+  const orders: Order[] = Array.from({ length: 4 }, (_, index) => ({
+    order_sn: `261017-${index}`,
+    offset: String(index),
+  }));
+  vi.mocked(PddClient.prototype.getOrders).mockResolvedValueOnce(orders);
+  vi.mocked(PddClient.prototype.getOrderDetail).mockRejectedValue(
+    new PddError("private response must stay hidden", "detail-unavailable"),
+  );
+  const { root, native, status, action } = ui(createView());
+  native.requestSubmit();
+  await vi.waitFor(() =>
+    expect(status().textContent).toBe("订单列表收集完成，详情不完整。"),
+  );
+  expect(root.textContent).toContain("已收集 4 笔订单 · 详情 0 笔");
+  expect(root.textContent).toContain("4 笔订单缺少详情");
+  expect(root.textContent).not.toContain("private response");
+  action("导出 JSON（详情不完整）").click();
+  expect(files.exportFile).toHaveBeenCalledWith(
+    orders.map((order) => ({
+      order,
+      detail: null,
+      detailFailure: "unavailable",
+    })),
+    "json",
+    null,
+    null,
+    false,
+  );
+  expect(PddClient.prototype.getOrderDetail).toHaveBeenCalledTimes(4);
+});
+
+test("date filtering keeps an unrecognizable order after a successful page and explains its date uncertainty", async () => {
+  const first: Order = { order_sn: "261017-a", offset: "a" };
+  const unknown: Order = { order_sn: "legacy-order", offset: "b" };
+  vi.mocked(PddClient.prototype.getOrders)
+    .mockResolvedValueOnce([first])
+    .mockResolvedValueOnce([unknown]);
+  const { root, native, input, running, alert, action } = ui(createView());
+  input("startDate").value = "2026-10-01";
+  input("endDate").value = "2026-10-31";
+  native.requestSubmit();
+  await vi.waitFor(() =>
+    expect(
+      vi.mocked(PddClient.prototype.getOrders).mock.calls.length,
+    ).toBeGreaterThanOrEqual(2),
+  );
+  await vi.waitFor(() => expect(running()).toBe(false));
+  expect(alert().textContent).toBe("");
+  expect(PddClient.prototype.getOrders).toHaveBeenCalledTimes(3);
+  expect(
+    root.querySelector('[data-ui="export-result"]')!.textContent,
+  ).toContain("1 笔订单无法按编号核对日期");
+  action("导出 JSON").click();
+  expect(files.exportFile).toHaveBeenCalledWith(
+    [
+      { order: first, detail: { orderSn: first.order_sn } },
+      {
+        order: unknown,
+        detail: { orderSn: unknown.order_sn },
+        dateUncertain: true,
+      },
+    ],
+    "json",
+    new Date("2026-10-01"),
+    new Date("2026-10-31"),
+    false,
+  );
+});
+
+test.each(["detail", "list", "unknown detail"] as const)(
+  "a mid-collection %s failure keeps completed orders available as a partial export",
+  async (stage) => {
+    const order: Order = { order_sn: "261017-a", offset: "a" };
+    const detail = { orderSn: order.order_sn };
+    const failure =
+      stage === "unknown detail"
+        ? new TypeError("private URL and token")
+        : new PddError("请求暂时失败。");
+    vi.mocked(PddClient.prototype.getOrders).mockResolvedValueOnce(
+      stage !== "list"
+        ? [order, { order_sn: "261017-b", offset: "b" }]
+        : [order],
+    );
+    vi.mocked(PddClient.prototype.getOrderDetail).mockResolvedValueOnce(detail);
+    if (stage !== "list") {
+      vi.mocked(PddClient.prototype.getOrderDetail).mockRejectedValueOnce(
+        failure,
+      );
+    } else {
+      vi.mocked(PddClient.prototype.getOrders).mockRejectedValueOnce(failure);
+    }
+    const { root, native, exports, alert, action } = ui(createView());
+    native.requestSubmit();
+    await vi.waitFor(() =>
+      expect(alert().textContent).toBe(
+        stage === "unknown detail"
+          ? "读取第 1 页第 2 笔订单详情时发生异常（TypeError），请保留此提示以便排查。"
+          : failure.message,
+      ),
+    );
+    expect(root.textContent).not.toContain("private URL and token");
+    expect(exports()?.hidden ?? true).toBe(false);
+    expect(
+      root.querySelector('[data-ui="export-result"]')!.textContent,
+    ).toContain("结果不完整");
+    expect(files.downloadFile).not.toHaveBeenCalled();
+    action("导出部分 JSON").click();
+    expect(files.exportFile).toHaveBeenCalledWith(
+      [{ order, detail }],
+      "json",
+      null,
+      null,
+      true,
+    );
+    expect(files.downloadFile).toHaveBeenCalledOnce();
+  },
+);
+
 test("a CSV failure uses a native alert and JSON retry retains the result", async () => {
   const result = mockResult();
   vi.mocked(files.exportFile).mockImplementationOnce(() => {
@@ -594,7 +788,9 @@ test("collection failure hides private diagnostics and a fresh attempt restores 
   const { root, native, exports, alert } = ui(createView());
   native.requestSubmit();
   await vi.waitFor(() =>
-    expect(alert().textContent).toBe("操作失败，请稍后重试。"),
+    expect(alert().textContent).toBe(
+      "检查收集设置时发生异常（Error），请保留此提示以便排查。",
+    ),
   );
   expect(root.textContent).not.toContain("private URL and token");
   expect(exports()?.hidden ?? true).toBe(true);

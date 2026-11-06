@@ -13,12 +13,18 @@ export function exportFile(
   startDate: Date | null,
   endDate: Date | null,
   partial = false,
+  imported = false,
 ): { name: string; blob: Blob } {
   const start = startDate?.toISOString().slice(0, 10) ?? "不限";
   const end = endDate?.toISOString().slice(0, 10) ?? "不限";
   const { encode, type } = formats[format];
+  const suffix = partial
+    ? "_不完整"
+    : entries.some((entry) => entry.detailFailure)
+      ? "_详情不完整"
+      : "";
   return {
-    name: `拼多多账单_${start}至${end}${partial ? "_不完整" : ""}.${format}`,
+    name: `拼多多账单_${imported ? "导入订单_补齐详情" : `${start}至${end}`}${suffix}.${format}`,
     blob: new Blob(encode(entries), { type }),
   };
 }
@@ -91,11 +97,13 @@ const assertCsvOrderDetail = createAssert<CsvOrderDetail | null>();
 function toCsvRows(
   entries: readonly CollectedOrder[],
 ): Record<string, string>[] {
+  const hasUncertainDates = entries.some((entry) => entry.dateUncertain);
+  const hasDetailFailures = entries.some((entry) => entry.detailFailure);
   return entries.map((entry) => {
     const order = assertCsvOrder(entry.order);
     const detail = assertCsvOrderDetail(entry.detail);
     const details = indexDetailFields(detail?.orderDescList);
-    return {
+    const row: Record<string, string> = {
       订单编号: order.order_sn,
       订单金额: formatAmount(order.order_amount),
       店铺: order.mall?.mall_name ?? "",
@@ -106,6 +114,20 @@ function toCsvRows(
       物流公司: details.get("物流公司") ?? "",
       快递单号: details.get("快递单号") ?? "",
     };
+    if (hasUncertainDates) {
+      row.日期核对 = entry.dateUncertain ? "日期待核对" : "";
+    }
+    if (hasDetailFailures) {
+      row.详情状态 =
+        entry.detailFailure === "unavailable"
+          ? "详情未能解析"
+          : entry.detailFailure === "paused"
+            ? "详情已暂停读取"
+            : entry.detail === null
+              ? "未请求详情"
+              : "已获取";
+    }
+    return row;
   });
 }
 

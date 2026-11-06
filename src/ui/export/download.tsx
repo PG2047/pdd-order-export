@@ -24,18 +24,20 @@ export function ExportDownload({
         if (event.currentTarget.isConnected) save(result, format);
       }}
     >
-      {`导出${result.partial ? "部分" : ""} ${format.toUpperCase()}`}
+      {`导出${result.partial ? "部分" : ""} ${format.toUpperCase()}${!result.partial && result.entries.some((entry) => entry.detailFailure) ? "（详情不完整）" : ""}`}
     </button>
   );
 }
 function save(
-  { entries, partial, startDate, endDate }: CollectResult,
+  { entries, partial, startDate, endDate, imported }: CollectResult,
   format: FileFormat,
 ) {
   if (!entries.length) return;
   let file;
   try {
-    file = exportFile(entries, format, startDate, endDate, partial);
+    file = imported
+      ? exportFile(entries, format, startDate, endDate, partial, true)
+      : exportFile(entries, format, startDate, endDate, partial);
   } catch {
     globalThis.alert(
       format === "csv"

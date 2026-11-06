@@ -98,6 +98,60 @@ test("reviewed pages cross protocol validation, collection and both export forma
   expect(fetcher).toHaveBeenCalledTimes(6);
 });
 
+test("a missing detail between pages retains the order and continues paging and details", async () => {
+  const orders = Array.from({ length: 5 }, (_, index) => ({
+    order_sn: `261017-${index + 1}`,
+    offset: String(index + 1),
+    order_amount: 100,
+  }));
+  const detailIds: string[] = [];
+  const fetcher = vi.fn<typeof fetch>(async (input, init) => {
+    const url = new URL(String(input), "https://mobile.pinduoduo.com");
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const offset = Number(body.offset ?? 0);
+      return Response.json({ orders: orders.slice(offset, offset + 2) });
+    }
+    const id = url.searchParams.get("order_sn")!;
+    detailIds.push(id);
+    return new Response(
+      id === "261017-4"
+        ? "<!doctype html><title>Order</title><main>Detail unavailable</main>"
+        : `<script>window.rawData=${JSON.stringify({ data: { orderSn: id } })};</script>`,
+    );
+  });
+  const result: CollectedOrder[] = [];
+  let failure: unknown;
+  try {
+    for await (const { orders: page } of collectOrders(
+      client(fetcher),
+      { ...options, pageSize: 2 },
+      new AbortController().signal,
+    )) {
+      for await (const entry of page) result.push(entry);
+    }
+  } catch (error) {
+    failure = error;
+  }
+  expect(
+    failure,
+    `collected ${result.length} orders before failure`,
+  ).toBeUndefined();
+  expect(result.map((entry) => entry.order)).toEqual(orders);
+  expect(result.filter((entry) => entry.detail !== null)).toHaveLength(4);
+  expect(result[3]).toMatchObject({
+    detail: null,
+    detailFailure: "unavailable",
+  });
+  expect(result[4]!.detail).toEqual({ orderSn: "261017-5" });
+  expect(detailIds).toHaveLength(5);
+  const json = exportFile(result, "json", null, null);
+  expect(json.name).toContain("_详情不完整");
+  expect(JSON.parse(await json.blob.text())).toEqual(result);
+  const csv = exportFile(result, "csv", null, null);
+  expect(await csv.blob.text()).toContain("详情未能解析");
+});
+
 // Mutate reviewed responses instead of constructing an unrelated toy protocol.
 test.each(["missing cursor", "invalid list"] as const)(
   "rejects a successful HTTP response with %s without returning a partial result",
